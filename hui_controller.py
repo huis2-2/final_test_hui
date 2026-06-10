@@ -18,9 +18,16 @@ class LaneKeepingController(object):
     def __init__(self):
         # 인식(BEV)은 정확한데 실차가 정면 기준 한쪽으로 쏠려 달리는 경우,
         # 로봇의 실제 중심선과 이미지 중심이 어긋난 것 → 여기서 픽셀 단위로 보정.
-        # 차가 "왼쪽"으로 쏠리면 이 값을 양수 방향으로 조금씩 늘려가며 테스트.
-        # (반대로 더 심해지면 부호를 반대로 바꿀 것)
-        self.camera_offset_x = 50
+        # ※ 이 값을 너무 크게 잡으면(예: 50px) lateral_error가 과도하게 커져
+        #   곡선 구간에서 heading_error 보정 방향까지 뒤집어버릴 수 있다.
+        #   작은 값(0~15px)으로만 사용하고, 직선 드리프트는 아래
+        #   steering_trim(각속도 상시 보정)으로 따로 처리한다.
+        self.camera_offset_x = 15
+
+        # 직선에서 차가 한쪽으로 쏠리는 기계적 편향 보정용 상시 각속도 트림.
+        # 차가 "왼쪽"으로 쏠리면 이 값을 양수 방향으로(+0.02씩) 늘려가며 테스트.
+        # (코너 보정량(0.3~0.6)에 비해 작게 유지해야 곡선 판단이 안 뒤집힌다)
+        self.steering_trim = 0.0
 
         # ── 직선 구간 게인 ────────────────────────────────────────────────
         self.Kp_lateral  = 0.005
@@ -43,19 +50,26 @@ class LaneKeepingController(object):
         # base_speed - angular_z * factor → factor가 클수록 코너에서 더 느려짐
         self.speed_drop_factor  = 0.40
 
+        # 차선을 잠시 놓쳤을 때 사용할 직전 조향/속도 명령 (초기값: 직진)
+        self.last_angular_z = 0.0
+        self.last_linear_x  = self.base_speed
+
     def compute_command(self, lane_info, img_width):
         twist_msg = Twist()
 
         if lane_info.stop:
-            # 노란선이 전혀 안 보이고 흰색만 보임 → 정지
+            # 흰색이 화면 대부분을 덮음(횡단보도 등) → 정지
             twist_msg.linear.x  = 0.0
             twist_msg.angular.z = 0.0
+            self.last_angular_z = 0.0
+            self.last_linear_x  = 0.0
             return twist_msg
 
         if not lane_info.valid or lane_info.center_x is None:
-            # 차선을 잠시 놓치면 조향각 0으로 직진 유지
-            twist_msg.linear.x  = self.base_speed
-            twist_msg.angular.z = 0.0
+            # 차선을 잠시 놓치면 직전 조향/속도를 그대로 유지
+            # (애매한 흰색 구간 등에서 갑자기 직진/정지로 튀는 것 방지)
+            twist_msg.linear.x  = self.last_linear_x
+            twist_msg.angular.z = self.last_angular_z
             return twist_msg
 
         robot_center_x = (img_width / 2.0) - self.camera_offset_x
@@ -73,7 +87,7 @@ class LaneKeepingController(object):
         else:
             kp_lat, kp_hdg = self.Kp_lateral, self.Kp_heading
 
-        angular_z = kp_lat * lateral_error + kp_hdg * heading_error
+        angular_z = kp_lat * lateral_error + kp_hdg * heading_error + self.steering_trim
         angular_z = max(min(angular_z, self.max_angular_speed), -self.max_angular_speed)
 
         linear_x = max(self.min_speed,
@@ -81,4 +95,7 @@ class LaneKeepingController(object):
 
         twist_msg.linear.x  = float(linear_x)
         twist_msg.angular.z = float(angular_z)
+
+        self.last_angular_z = angular_z
+        self.last_linear_x  = linear_x
         return twist_msg
